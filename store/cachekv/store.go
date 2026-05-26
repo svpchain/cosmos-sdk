@@ -37,10 +37,9 @@ var _ types.CacheKVStore = (*Store)(nil)
 // NewStore creates a new Store object
 func NewStore(parent types.KVStore) *Store {
 	return &Store{
-		cache:         make(map[string]*cValue),
-		unsortedCache: make(map[string]struct{}),
-		// sortedCache (the ordered write cache) is allocated lazily in dirtyItems,
-		// so read-only / never-iterated branched stores don't allocate a btree.
+		// cache, unsortedCache and sortedCache are all allocated lazily (on first
+		// write / iteration), so read-only / untouched branched stores allocate
+		// nothing here beyond the Store struct itself.
 		parent: parent,
 	}
 }
@@ -407,6 +406,12 @@ func (store *Store) clearUnsortedCacheSubset(unsorted []*kv.Pair, sortState sort
 // A `nil` value means a deletion.
 func (store *Store) setCacheValue(key, value []byte, dirty bool) {
 	keyStr := conv.UnsafeBytesToStr(key)
+	// Lazily allocate the write caches on first mutation; NewStore leaves them
+	// nil so read-only / untouched branched stores never allocate them.
+	if store.cache == nil {
+		store.cache = make(map[string]*cValue)
+		store.unsortedCache = make(map[string]struct{})
+	}
 	store.cache[keyStr] = &cValue{
 		value: value,
 		dirty: dirty,
