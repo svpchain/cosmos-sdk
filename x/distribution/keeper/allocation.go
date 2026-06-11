@@ -28,18 +28,6 @@ func (k Keeper) AllocateTokens(ctx context.Context, totalPreviousPower int64, bo
 		return err
 	}
 
-	if !feesCollectedInt.IsZero() {
-		sdkCtx := sdk.UnwrapSDKContext(ctx)
-		sdkCtx.EventManager().EmitEvent(
-			sdk.NewEvent(
-				types.EventTypeTransferCollectedFees,
-				sdk.NewAttribute(types.AttributeKeySenderModule, k.feeCollectorName),
-				sdk.NewAttribute(types.AttributeKeyRecipientModule, types.ModuleName),
-				sdk.NewAttribute(sdk.AttributeKeyAmount, feesCollectedInt.String()),
-			),
-		)
-	}
-
 	// temporary workaround to keep CanWithdrawInvariant happy
 	// general discussions here: https://github.com/cosmos/cosmos-sdk/issues/2906#issuecomment-441867634
 	feePool, err := k.FeePool.Get(ctx)
