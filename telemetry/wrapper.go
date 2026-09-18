@@ -9,7 +9,11 @@ import (
 // Common metric key constants
 const (
 	MetricKeyBeginBlocker       = "begin_blocker"
+	MetricKeyCheckTx            = "check_tx"
+	MetricKeyCommit             = "commit"
 	MetricKeyEndBlocker         = "end_blocker"
+	MetricKeyFinalizeBlock      = "finalize_block"
+	MetricKeyPrepareProposal    = "prepare_proposal"
 	MetricKeyPrepareCheckStater = "prepare_check_stater"
 	MetricKeyPrecommiter        = "precommiter"
 	MetricLabelNameModule       = "module"

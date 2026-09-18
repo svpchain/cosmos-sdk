@@ -355,6 +355,8 @@ func (app *BaseApp) ApplySnapshotChunk(req *abci.RequestApplySnapshotChunk) (*ab
 // will contain relevant error information. Regardless of tx execution outcome,
 // the ResponseCheckTx will contain relevant gas execution context.
 func (app *BaseApp) CheckTx(req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+	defer telemetry.ModuleMeasureSince("baseapp", time.Now(), telemetry.MetricKeyCheckTx)
+
 	var mode execMode
 
 	switch {
@@ -396,6 +398,8 @@ func (app *BaseApp) CheckTx(req *abci.RequestCheckTx) (*abci.ResponseCheckTx, er
 // Ref: https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-060-abci-1.0.md
 // Ref: https://github.com/cometbft/cometbft/blob/main/spec/abci/abci%2B%2B_basic_concepts.md
 func (app *BaseApp) PrepareProposal(req *abci.RequestPrepareProposal) (resp *abci.ResponsePrepareProposal, err error) {
+	defer telemetry.ModuleMeasureSince("baseapp", time.Now(), telemetry.MetricKeyPrepareProposal)
+
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 
@@ -894,6 +898,8 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 // extensions into the proposal, which should not themselves be executed in cases
 // where they adhere to the sdk.Tx interface.
 func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.ResponseFinalizeBlock, err error) {
+	defer telemetry.ModuleMeasureSince("baseapp", time.Now(), telemetry.MetricKeyFinalizeBlock)
+
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 
@@ -962,6 +968,8 @@ func (app *BaseApp) checkHalt(height int64, time time.Time) error {
 // against that height and gracefully halt if it matches the latest committed
 // height.
 func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
+	defer telemetry.ModuleMeasureSince("baseapp", time.Now(), telemetry.MetricKeyCommit)
+
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 
