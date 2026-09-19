@@ -206,6 +206,11 @@ type BaseApp struct {
 	cacheMsWithVersionMtx sync.Mutex
 
 	blockDelayGetter sdk.BlockDelayGetter
+
+	// abciTimings accumulates ABCI execution durations between commits. Commit
+	// writes one structured summary per block so timing data survives process
+	// restarts in the node log without logging every CheckTx call.
+	abciTimings abciTimingRecorder
 }
 
 // NewBaseApp returns a reference to an initialized BaseApp. It accepts a
