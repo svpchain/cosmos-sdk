@@ -66,6 +66,12 @@ func (bt BTree) ReverseIterator(start, end []byte) (types.Iterator, error) {
 	return newMemIterator(start, end, bt, false), nil
 }
 
+// IsNil reports whether this is the zero-value wrapper with no underlying tree
+// allocated yet (cachekv allocates the sorted cache lazily on first iteration).
+func (bt BTree) IsNil() bool {
+	return bt.tree == nil
+}
+
 // Copy the tree. This is a copy-on-write operation and is very fast because
 // it only performs a shadowed copy.
 func (bt BTree) Copy() BTree {
