@@ -24,9 +24,12 @@ type cValue struct {
 }
 
 // Store wraps an in-memory cache around an underlying types.KVStore.
+//
+// cache holds cValue by value: one heap object per Get-miss/Set was a measurable
+// share of allocation volume on the tx hot path.
 type Store struct {
 	mtx           sync.Mutex
-	cache         map[string]*cValue
+	cache         map[string]cValue
 	unsortedCache map[string]struct{}
 	sortedCache   internal.BTree // always ascending sorted
 	parent        types.KVStore
@@ -37,10 +40,10 @@ var _ types.CacheKVStore = (*Store)(nil)
 // NewStore creates a new Store object
 func NewStore(parent types.KVStore) *Store {
 	return &Store{
-		cache:         make(map[string]*cValue),
-		unsortedCache: make(map[string]struct{}),
-		sortedCache:   internal.NewBTree(),
-		parent:        parent,
+		// cache, unsortedCache and sortedCache are all allocated lazily (on first
+		// write / iteration), so read-only / untouched branched stores allocate
+		// nothing here beyond the Store struct itself.
+		parent: parent,
 	}
 }
 
@@ -99,7 +102,7 @@ func (store *Store) resetCaches() {
 		// (e.g. Epoch block, Genesis block, etc). Free the old caches from memory, and let them get re-allocated.
 		// TODO: In a future CacheKV redesign, such linear workloads should get into a different cache instantiation.
 		// 100_000 is arbitrarily chosen as it solved Osmosis' InitGenesis RAM problem.
-		store.cache = make(map[string]*cValue)
+		store.cache = make(map[string]cValue)
 		store.unsortedCache = make(map[string]struct{})
 	} else {
 		// Clear the cache using the map clearing idiom
@@ -112,7 +115,9 @@ func (store *Store) resetCaches() {
 			delete(store.unsortedCache, key)
 		}
 	}
-	store.sortedCache = internal.NewBTree()
+	// Clear lazily: drop the btree (re-allocated on next iteration via dirtyItems)
+	// rather than allocating a fresh empty one on every reset.
+	store.sortedCache = internal.BTree{}
 }
 
 // Implements Cachetypes.KVStore.
@@ -121,13 +126,15 @@ func (store *Store) Write() {
 	defer store.mtx.Unlock()
 
 	if len(store.cache) == 0 && len(store.unsortedCache) == 0 {
-		store.sortedCache = internal.NewBTree()
+		// Nothing buffered; clear lazily. Avoids allocating a btree for an empty
+		// store, which Write() hits for every untouched branched substore at commit.
+		store.sortedCache = internal.BTree{}
 		return
 	}
 
 	type cEntry struct {
 		key string
-		val *cValue
+		val cValue
 	}
 
 	// We need a copy of all of the keys.
@@ -294,6 +301,10 @@ const minSortSize = 1024
 
 // Constructs a slice of dirty items, to use w/ memIterator.
 func (store *Store) dirtyItems(start, end []byte) {
+	// Lazily allocate the sorted write cache; only iterated stores need it.
+	if store.sortedCache.IsNil() {
+		store.sortedCache = internal.NewBTree()
+	}
 	startStr, endStr := conv.UnsafeBytesToStr(start), conv.UnsafeBytesToStr(end)
 	if end != nil && startStr > endStr {
 		// Nothing to do here.
@@ -398,7 +409,13 @@ func (store *Store) clearUnsortedCacheSubset(unsorted []*kv.Pair, sortState sort
 // A `nil` value means a deletion.
 func (store *Store) setCacheValue(key, value []byte, dirty bool) {
 	keyStr := conv.UnsafeBytesToStr(key)
-	store.cache[keyStr] = &cValue{
+	// Lazily allocate the write caches on first mutation; NewStore leaves them
+	// nil so read-only / untouched branched stores never allocate them.
+	if store.cache == nil {
+		store.cache = make(map[string]cValue)
+		store.unsortedCache = make(map[string]struct{})
+	}
+	store.cache[keyStr] = cValue{
 		value: value,
 		dirty: dirty,
 	}

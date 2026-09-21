@@ -433,7 +433,13 @@ func (rs *Store) PopStateCache() []*types.StoreKVPair {
 
 // LatestVersion returns the latest version in the store
 func (rs *Store) LatestVersion() int64 {
-	return rs.LastCommitID().Version
+	// Read the version directly; do NOT route through LastCommitID(), which
+	// computes the full app-hash merkle root. LatestVersion is called on every
+	// query (baseapp.CreateQueryContext), so hashing here is pure waste.
+	if rs.lastCommitInfo == nil {
+		return GetLatestVersion(rs.db)
+	}
+	return rs.lastCommitInfo.Version
 }
 
 // LastCommitID implements Committer/CommitStore.
@@ -446,7 +452,9 @@ func (rs *Store) LastCommitID() types.CommitID {
 			Hash:    appHash, // set empty apphash to sha256([]byte{}) if info is nil
 		}
 	}
-	if len(rs.lastCommitInfo.CommitID().Hash) == 0 {
+	// Compute the commit ID (and thus the hash) once, not twice.
+	commitID := rs.lastCommitInfo.CommitID()
+	if len(commitID.Hash) == 0 {
 		emptyHash := sha256.Sum256([]byte{})
 		appHash := emptyHash[:]
 		return types.CommitID{
@@ -455,7 +463,7 @@ func (rs *Store) LastCommitID() types.CommitID {
 		}
 	}
 
-	return rs.lastCommitInfo.CommitID()
+	return commitID
 }
 
 // Commit implements Committer/CommitStore.
@@ -511,24 +519,31 @@ func (rs *Store) Commit() types.CommitID {
 // WorkingHash returns the current hash of the store.
 // it will be used to get the current app hash before commit.
 func (rs *Store) WorkingHash() []byte {
-	storeInfos := make([]types.StoreInfo, 0, len(rs.stores))
 	storeKeys := keysFromStoreKeyMap(rs.stores)
 
-	for _, key := range storeKeys {
-		store := rs.stores[key]
+	// Every IAVL tree hashes its own dirty nodes; the trees are independent, so
+	// hash them concurrently (this runs on the FinalizeBlock critical path,
+	// under the app's write lock).
+	hashes := make([][]byte, len(storeKeys))
+	forEachStoreParallel(len(storeKeys), func(i int) {
+		store := rs.stores[storeKeys[i]]
+		if store.GetStoreType() != types.StoreTypeIAVL || rs.removalMap[storeKeys[i]] {
+			return
+		}
+		hashes[i] = store.WorkingHash()
+	})
 
+	storeInfos := make([]types.StoreInfo, 0, len(rs.stores))
+	for i, key := range storeKeys {
+		store := rs.stores[key]
 		if store.GetStoreType() != types.StoreTypeIAVL {
 			continue
 		}
-
 		if !rs.removalMap[key] {
-			si := types.StoreInfo{
-				Name: key.Name(),
-				CommitId: types.CommitID{
-					Hash: store.WorkingHash(),
-				},
-			}
-			storeInfos = append(storeInfos, si)
+			storeInfos = append(storeInfos, types.StoreInfo{
+				Name:     key.Name(),
+				CommitId: types.CommitID{Hash: hashes[i]},
+			})
 		}
 	}
 
@@ -537,6 +552,46 @@ func (rs *Store) WorkingHash() []byte {
 	})
 
 	return types.CommitInfo{StoreInfos: storeInfos}.Hash()
+}
+
+// parallelStoreOpMinStores is the number of stores from which per-store work
+// (hashing, committing) is spread over goroutines instead of done serially.
+const parallelStoreOpMinStores = 4
+
+// forEachStoreParallel runs fn(i) for i in [0, n), concurrently when n is large
+// enough to be worth it. A panic in any fn is re-raised on the caller.
+func forEachStoreParallel(n int, fn func(i int)) {
+	if n < parallelStoreOpMinStores {
+		for i := 0; i < n; i++ {
+			fn(i)
+		}
+		return
+	}
+	var (
+		wg       sync.WaitGroup
+		panicMtx sync.Mutex
+		panicVal any
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicMtx.Lock()
+					if panicVal == nil {
+						panicVal = r
+					}
+					panicMtx.Unlock()
+				}
+			}()
+			fn(i)
+		}(i)
+	}
+	wg.Wait()
+	if panicVal != nil {
+		panic(panicVal)
+	}
 }
 
 // CacheWrap implements CacheWrapper/Store/CommitStore.
@@ -1197,20 +1252,27 @@ func commitStores(version int64, storeMap map[types.StoreKey]types.CommitKVStore
 	storeInfos := make([]types.StoreInfo, 0, len(storeMap))
 	storeKeys := keysFromStoreKeyMap(storeMap)
 
-	for _, key := range storeKeys {
-		store := storeMap[key]
+	// Each store commits its own tree (and writes its own batch to the shared,
+	// thread-safe DB); the stores are independent so commit them concurrently.
+	commitIDs := make([]types.CommitID, len(storeKeys))
+	forEachStoreParallel(len(storeKeys), func(i int) {
+		store := storeMap[storeKeys[i]]
 		last := store.LastCommitID()
 
 		// If a commit event execution is interrupted, a new iavl store's version
 		// will be larger than the RMS's metadata, when the block is replayed, we
 		// should avoid committing that iavl store again.
-		var commitID types.CommitID
 		if last.Version >= version {
 			last.Version = version
-			commitID = last
+			commitIDs[i] = last
 		} else {
-			commitID = store.Commit()
+			commitIDs[i] = store.Commit()
 		}
+	})
+
+	for i, key := range storeKeys {
+		store := storeMap[key]
+		commitID := commitIDs[i]
 
 		storeType := store.GetStoreType()
 		if storeType == types.StoreTypeTransient || storeType == types.StoreTypeMemory {

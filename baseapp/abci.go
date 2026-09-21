@@ -794,14 +794,42 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 			WithHeaderHash(req.Hash))
 	}
 
+	// Per-stage wall time of the block on the consensus critical path; logged once
+	// per block so that block execution can be attributed without a profiler.
+	var (
+		stageStart    = time.Now()
+		preBlockDur   time.Duration
+		beginBlockDur time.Duration
+		txsDur        time.Duration
+		endBlockDur   time.Duration
+		slowestTx     time.Duration
+		slowestTxIdx  = -1
+	)
+	defer func() {
+		app.logger.Info("finalize block stages",
+			"height", req.Height,
+			"num_txs", len(req.Txs),
+			"pre_block_ms", preBlockDur.Milliseconds(),
+			"begin_block_ms", beginBlockDur.Milliseconds(),
+			"txs_ms", txsDur.Milliseconds(),
+			"slowest_tx_ms", slowestTx.Milliseconds(),
+			"slowest_tx_idx", slowestTxIdx,
+			"end_block_ms", endBlockDur.Milliseconds(),
+			"total_ms", time.Since(stageStart).Milliseconds(),
+		)
+	}()
+
 	if err := app.preBlock(req); err != nil {
 		return nil, err
 	}
+	preBlockDur = time.Since(stageStart)
 
+	beginBlockStart := time.Now()
 	beginBlock, err := app.beginBlock(req)
 	if err != nil {
 		return nil, err
 	}
+	beginBlockDur = time.Since(beginBlockStart)
 
 	// First check for an abort signal after beginBlock, as it's the first place
 	// we spend any significant amount of time.
@@ -824,11 +852,16 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 	// NOTE: Not all raw transactions may adhere to the sdk.Tx interface, e.g.
 	// vote extensions, so skip those.
 	txResults := make([]*abci.ExecTxResult, 0, len(req.Txs))
-	for _, rawTx := range req.Txs {
+	txsStart := time.Now()
+	for i, rawTx := range req.Txs {
 		var response *abci.ExecTxResult
 
-		if _, err := app.txDecoder(rawTx); err == nil {
-			response = app.deliverTx(rawTx)
+		txStart := time.Now()
+		if tx, err := app.txDecoder(rawTx); err == nil {
+			response = app.deliverDecodedTx(rawTx, tx)
+			if d := time.Since(txStart); d > slowestTx {
+				slowestTx, slowestTxIdx = d, i
+			}
 		} else {
 			// In the case where a transaction included in a block proposal is malformed,
 			// we still want to return a default response to comet. This is because comet
@@ -852,15 +885,18 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 
 		txResults = append(txResults, response)
 	}
+	txsDur = time.Since(txsStart)
 
 	if app.finalizeBlockState.ms.TracingEnabled() {
 		app.finalizeBlockState.ms = app.finalizeBlockState.ms.SetTracingContext(nil).(storetypes.CacheMultiStore)
 	}
 
+	endBlockStart := time.Now()
 	endBlock, err := app.endBlock(app.finalizeBlockState.Context())
 	if err != nil {
 		return nil, err
 	}
+	endBlockDur = time.Since(endBlockStart)
 
 	// check after endBlock if we should abort, to avoid propagating the result
 	select {
@@ -894,6 +930,26 @@ func (app *BaseApp) internalFinalizeBlock(ctx context.Context, req *abci.Request
 // extensions into the proposal, which should not themselves be executed in cases
 // where they adhere to the sdk.Tx interface.
 func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.ResponseFinalizeBlock, err error) {
+	// When optimistic execution is running the block has already been (or is being)
+	// executed by the OE goroutine, which never holds `app.mtx`: it only touches
+	// `finalizeBlockState`, which is disjoint from the check state used by the
+	// concurrently running CheckTx. Wait for it *before* taking the write lock so
+	// that CheckTx keeps flowing for the whole duration of block execution instead
+	// of stalling until the OE result is available. Only the hash computation and
+	// the streaming hooks below need exclusive access.
+	var (
+		oeHandled bool
+		oeAborted bool
+	)
+	if app.optimisticExec.Initialized() {
+		// check if the hash we got is the same as the one we are executing
+		oeAborted = app.optimisticExec.AbortIfNeeded(req)
+		// Wait for the OE to finish, regardless of whether it was aborted or not
+		res, err = app.optimisticExec.WaitResult()
+		app.optimisticExec.Reset()
+		oeHandled = true
+	}
+
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 
@@ -906,16 +962,9 @@ func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (res *abci.Res
 		}
 	}()
 
-	if app.optimisticExec.Initialized() {
-		// check if the hash we got is the same as the one we are executing
-		aborted := app.optimisticExec.AbortIfNeeded(req)
-		// Wait for the OE to finish, regardless of whether it was aborted or not
-		res, err = app.optimisticExec.WaitResult()
-
-		app.optimisticExec.Reset()
-
+	if oeHandled {
 		// only return if we are not aborting
-		if !aborted {
+		if !oeAborted {
 			if res != nil {
 				res.AppHash = app.workingHash()
 			}
@@ -962,8 +1011,10 @@ func (app *BaseApp) checkHalt(height int64, time time.Time) error {
 // against that height and gracefully halt if it matches the latest committed
 // height.
 func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
+	tStart := time.Now()
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
+	tLocked := time.Now()
 
 	header := app.finalizeBlockState.Context().BlockHeader()
 	retainHeight := app.GetBlockRetentionHeight(header.Height)
@@ -971,6 +1022,7 @@ func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
 	if app.precommiter != nil {
 		app.precommiter(app.finalizeBlockState.Context())
 	}
+	tPrecommit := time.Now()
 
 	rms, ok := app.cms.(*rootmulti.Store)
 	if ok {
@@ -978,6 +1030,19 @@ func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
 	}
 
 	app.cms.Commit()
+	tCommitted := time.Now()
+
+	defer func() {
+		tEnd := time.Now()
+		app.logger.Info("commit stages",
+			"height", header.Height,
+			"lock_wait_ms", tLocked.Sub(tStart).Milliseconds(),
+			"precommit_ms", tPrecommit.Sub(tLocked).Milliseconds(),
+			"cms_commit_ms", tCommitted.Sub(tPrecommit).Milliseconds(),
+			"prepare_check_state_ms", tEnd.Sub(tCommitted).Milliseconds(),
+			"total_ms", tEnd.Sub(tStart).Milliseconds(),
+		)
+	}()
 
 	resp := &abci.ResponseCommit{
 		RetainHeight: retainHeight,

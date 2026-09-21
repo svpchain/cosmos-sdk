@@ -334,12 +334,38 @@ func (c Context) Value(key interface{}) interface{} {
 
 // KVStore fetches a KVStore from the MultiStore.
 func (c Context) KVStore(key storetypes.StoreKey) storetypes.KVStore {
-	return gaskv.NewStore(c.ms.GetKVStore(key), c.gasMeter, c.kvGasConfig)
+	store := c.ms.GetKVStore(key)
+	if isGasFreeMeter(c.gasMeter) {
+		return store
+	}
+	return gaskv.NewStore(store, c.gasMeter, c.kvGasConfig)
 }
 
 // TransientStore fetches a TransientStore from the MultiStore.
 func (c Context) TransientStore(key storetypes.StoreKey) storetypes.KVStore {
-	return gaskv.NewStore(c.ms.GetKVStore(key), c.gasMeter, c.transientKVGasConfig)
+	store := c.ms.GetKVStore(key)
+	if isGasFreeMeter(c.gasMeter) {
+		return store
+	}
+	return gaskv.NewStore(store, c.gasMeter, c.transientKVGasConfig)
+}
+
+// GasFreeMeter is optionally implemented by gas meters for which ConsumeGas is
+// a no-op and GasConsumed is always 0 (e.g. a "free infinite" meter used for
+// txs that are exempt from gas). For such meters the gas-metering KVStore
+// wrapper has no observable effect, so Context.KVStore skips allocating it;
+// that wrapper was a measurable share of tx hot-path allocations.
+type GasFreeMeter interface {
+	storetypes.GasMeter
+	GasFree() bool
+}
+
+func isGasFreeMeter(gm storetypes.GasMeter) bool {
+	if gm == nil {
+		return false
+	}
+	free, ok := gm.(GasFreeMeter)
+	return ok && free.GasFree()
 }
 
 // CacheContext returns a new Context with the multi-store cached and a new

@@ -201,6 +201,10 @@ type BaseApp struct {
 	// Used to synchronize the application when using an unsynchronized ABCI++ client.
 	mtx sync.RWMutex
 
+	// checkTxSem, when non-nil, bounds the number of concurrently executing CheckTx
+	// (not ReCheckTx) calls; see SetCheckTxConcurrency.
+	checkTxSem chan struct{}
+
 	// Used to synchronize CacheMultistoreWithVersion since the multistore mutates version
 	// information internally during first time loads leading to data races.
 	cacheMsWithVersionMtx sync.Mutex
@@ -780,7 +784,16 @@ func (app *BaseApp) beginBlock(req *abci.RequestFinalizeBlock) (sdk.BeginBlock, 
 	return resp, nil
 }
 
-func (app *BaseApp) deliverTx(tx []byte) *abci.ExecTxResult {
+func (app *BaseApp) deliverTx(txBytes []byte) *abci.ExecTxResult {
+	tx, err := app.txDecoder(txBytes)
+	if err != nil {
+		return sdkerrors.ResponseExecTxResultWithEvents(err, 0, 0, nil, app.trace)
+	}
+	return app.deliverDecodedTx(txBytes, tx)
+}
+
+// deliverDecodedTx is deliverTx for a tx already decoded by the caller (see runDecodedTx).
+func (app *BaseApp) deliverDecodedTx(txBytes []byte, tx sdk.Tx) *abci.ExecTxResult {
 	gInfo := sdk.GasInfo{}
 	resultStr := "successful"
 
@@ -793,7 +806,7 @@ func (app *BaseApp) deliverTx(tx []byte) *abci.ExecTxResult {
 		telemetry.SetGauge(float32(gInfo.GasWanted), "tx", "gas", "wanted")
 	}()
 
-	gInfo, result, anteEvents, err := app.runTx(execModeFinalize, tx)
+	gInfo, result, anteEvents, err := app.runDecodedTx(execModeFinalize, txBytes, tx)
 	if err != nil {
 		resultStr = "failed"
 		resp = sdkerrors.ResponseExecTxResultWithEvents(
@@ -891,6 +904,15 @@ func (app *BaseApp) runCheckTxConcurrently(mode execMode, txBytes []byte) (gInfo
 	// embedded here to ensure that the lifetime of the mutex is limited to only this function allowing
 	// for the return values to be computed without holding the lock.
 	func() {
+		// Bound the number of CheckTx executing at once (see SetCheckTxConcurrency). The permit is
+		// taken before the read lock so that queued requests never delay FinalizeBlock/Commit, which
+		// need the write lock. Rechecks run while the mempool is locked, i.e. with no competing
+		// CheckTx, and keep their own lane count.
+		if app.checkTxSem != nil && mode == execModeCheck {
+			app.checkTxSem <- struct{}{}
+			defer func() { <-app.checkTxSem }()
+		}
+
 		app.mtx.RLock()
 		defer app.mtx.RUnlock()
 
@@ -981,6 +1003,18 @@ func (app *BaseApp) runCheckTxConcurrently(mode execMode, txBytes []byte) (gInfo
 // returned if the tx does not run out of gas and if all the messages are valid
 // and execute successfully. An error is returned otherwise.
 func (app *BaseApp) runTx(mode execMode, txBytes []byte) (gInfo sdk.GasInfo, result *sdk.Result, anteEvents []abci.Event, err error) {
+	tx, err := app.txDecoder(txBytes)
+	if err != nil {
+		return sdk.GasInfo{}, nil, nil, err
+	}
+	return app.runDecodedTx(mode, txBytes, tx)
+}
+
+// runDecodedTx is runTx for a tx that the caller has already decoded from
+// txBytes. FinalizeBlock decodes every tx once to tell sdk.Txs from injected
+// non-tx payloads (vote extensions); with thousands of txs per block decoding
+// them a second time in runTx is a measurable share of block execution.
+func (app *BaseApp) runDecodedTx(mode execMode, txBytes []byte, tx sdk.Tx) (gInfo sdk.GasInfo, result *sdk.Result, anteEvents []abci.Event, err error) {
 	if mode == execModeCheck || mode == execModeReCheck {
 		panic("Expected CheckTx and RecheckTx to be executed via runCheckTxConcurrently")
 	}
@@ -1030,11 +1064,6 @@ func (app *BaseApp) runTx(mode execMode, txBytes []byte) (gInfo sdk.GasInfo, res
 	// be executed first (deferred statements are executed as stack).
 	if mode == execModeFinalize {
 		defer consumeBlockGas()
-	}
-
-	tx, err := app.txDecoder(txBytes)
-	if err != nil {
-		return sdk.GasInfo{}, nil, nil, err
 	}
 
 	msgs := tx.GetMsgs()

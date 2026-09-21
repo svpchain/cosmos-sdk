@@ -22,18 +22,18 @@ func BenchmarkLargeUnsortedMisses(b *testing.B) {
 }
 
 func generateStore() *Store {
-	cache := map[string]*cValue{}
+	cache := map[string]cValue{}
 	unsorted := map[string]struct{}{}
 	for i := 0; i < 5000; i++ {
 		key := "A" + strconv.Itoa(i)
 		unsorted[key] = struct{}{}
-		cache[key] = &cValue{}
+		cache[key] = cValue{}
 	}
 
 	for i := 0; i < 5000; i++ {
 		key := "Z" + strconv.Itoa(i)
 		unsorted[key] = struct{}{}
-		cache[key] = &cValue{}
+		cache[key] = cValue{}
 	}
 
 	return &Store{

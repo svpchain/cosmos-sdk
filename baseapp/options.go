@@ -117,6 +117,22 @@ func SetOptimisticExecution(opts ...func(*oe.OptimisticExecution)) func(*BaseApp
 	}
 }
 
+// SetCheckTxConcurrency bounds how many CheckTx calls execute concurrently (0 = unbounded).
+//
+// CheckTx runs in parallel under the app's read lock; with hundreds of RPC clients in flight the
+// goroutines mostly contend on the shared check-state store mutexes and thrash the scheduler, which
+// also delays FinalizeBlock/Commit whenever they block and need a P back. A small bound (a few
+// permits) keeps the useful parallelism and turns the rest into a cheap FIFO wait.
+func SetCheckTxConcurrency(n int) func(*BaseApp) {
+	return func(app *BaseApp) {
+		if n <= 0 {
+			app.checkTxSem = nil
+			return
+		}
+		app.checkTxSem = make(chan struct{}, n)
+	}
+}
+
 // DisableBlockGasMeter disables the block gas meter.
 func DisableBlockGasMeter() func(*BaseApp) {
 	return func(app *BaseApp) { app.SetDisableBlockGasMeter(true) }

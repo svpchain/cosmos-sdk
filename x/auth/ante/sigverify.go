@@ -371,7 +371,10 @@ func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, sim
 	}
 
 	for _, signer := range signers {
-		acc := isd.ak.GetAccount(ctx, signer)
+		acc, err := GetSignerAcc(ctx, isd.ak, signer)
+		if err != nil {
+			return ctx, err
+		}
 		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
 			panic(err)
 		}
@@ -483,14 +486,54 @@ func ConsumeMultisignatureVerificationGas(
 	return nil
 }
 
+// signerAccCacheKey is the context key under which a *SignerAccCache is stored.
+type signerAccCacheKey struct{}
+
+// SignerAccCache memoizes signer account lookups for the duration of one ante
+// handler invocation. The ante chain reads the same signer account in several
+// decorators (pubkey, sig gas, sig verification, sequence increment), each of
+// which otherwise pays a store read plus an Any/proto decode. Decorators mutate
+// the returned account in place and persist it with SetAccount, so the cached
+// object stays consistent with the store within the chain.
+//
+// The cache is opt-in: an app installs it with WithSignerAccCache on a context
+// that is scoped to a single tx (branched store), and must not let it outlive
+// that scope.
+type SignerAccCache struct {
+	accs map[string]sdk.AccountI
+}
+
+// WithSignerAccCache returns ctx with a fresh, empty SignerAccCache attached.
+func WithSignerAccCache(ctx sdk.Context) sdk.Context {
+	return ctx.WithValue(signerAccCacheKey{}, &SignerAccCache{})
+}
+
+func signerAccCacheFromCtx(ctx sdk.Context) *SignerAccCache {
+	cache, _ := ctx.Value(signerAccCacheKey{}).(*SignerAccCache)
+	return cache
+}
+
 // GetSignerAcc returns an account for a given address that is expected to sign
 // a transaction.
 func GetSignerAcc(ctx sdk.Context, ak AccountKeeper, addr sdk.AccAddress) (sdk.AccountI, error) {
-	if acc := ak.GetAccount(ctx, addr); acc != nil {
-		return acc, nil
+	cache := signerAccCacheFromCtx(ctx)
+	if cache != nil {
+		if acc, ok := cache.accs[string(addr)]; ok {
+			return acc, nil
+		}
 	}
 
-	return nil, errorsmod.Wrapf(sdkerrors.ErrUnknownAddress, "account %s does not exist", addr)
+	acc := ak.GetAccount(ctx, addr)
+	if acc == nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrUnknownAddress, "account %s does not exist", addr)
+	}
+	if cache != nil {
+		if cache.accs == nil {
+			cache.accs = make(map[string]sdk.AccountI, 1)
+		}
+		cache.accs[string(addr)] = acc
+	}
+	return acc, nil
 }
 
 // CountSubKeys counts the total number of keys for a multi-sig public key.
